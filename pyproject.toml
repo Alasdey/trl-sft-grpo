@@ -1,0 +1,18 @@
+[project]
+name = "trl-sft-grpo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=0.28.0",
+    "bitsandbytes>=0.43.0",
+    "datasets>=2.18.0",
+    "flash-attn>=2.8.3",
+    "huggingface-hub>=0.22.0",
+    "peft>=0.10.0",
+    "torch>=2.1.0",
+    "transformers>=4.51.0",
+    "trl[vllm]>=0.16.0",
+    "wandb>=0.16.0",
+]

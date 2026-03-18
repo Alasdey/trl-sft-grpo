@@ -17,7 +17,6 @@ from huggingface_hub import login
 from peft import LoraConfig
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
-from vllm import SamplingParams
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -58,6 +57,45 @@ def save_code(dest_folder: str = "./trainer_output") -> None:
     logger.info("Saved script snapshot to %s", dest_path)
 
 
+def resolve_model_path(path: str) -> str:
+    """
+    If the user points at the SFT output_dir (which contains a 'merged/'
+    subdirectory), automatically resolve to the merged checkpoint.
+    Also validates that the path looks like a full model, not a bare adapter.
+    """
+    merged_subdir = os.path.join(path, "merged")
+    if os.path.isdir(merged_subdir):
+        logger.info(
+            "Found 'merged/' subdirectory inside %s — using %s as model path.",
+            path, merged_subdir,
+        )
+        return merged_subdir
+
+    # Check if this is an adapter-only dir (common mistake)
+    if os.path.isdir(path):
+        has_adapter_config = os.path.isfile(os.path.join(path, "adapter_config.json"))
+        has_model_weights = (
+            os.path.isfile(os.path.join(path, "model.safetensors"))
+            or os.path.isfile(os.path.join(path, "pytorch_model.bin"))
+            or any(
+                f.startswith("model-") and f.endswith(".safetensors")
+                for f in os.listdir(path)
+            )
+            or os.path.isfile(os.path.join(path, "config.json"))
+        )
+
+        if has_adapter_config and not has_model_weights:
+            raise ValueError(
+                f"The path '{path}' contains only a LoRA adapter "
+                f"(adapter_config.json found, but no model weights). "
+                f"GRPO needs a full/merged model. "
+                f"Re-run SFT with the updated train_sft.py which saves a "
+                f"merged checkpoint, or point to a Hub model id."
+            )
+
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -70,20 +108,6 @@ def data_prep(data: dict) -> dict:
         {"role": "assistant", "content": data["answer"]},
     ]
     return data
-
-
-def build_dataset(dataset_name: str, skip: int, max_samples: int):
-    dataset = load_dataset(dataset_name)["train"]
-    logger.info("Loaded %d raw samples.", len(dataset))
-
-    not_seen_yet = dataset.select(range(skip, len(dataset)))
-    subset = not_seen_yet.filter(
-        lambda example: len(example["solution"][0]["content"].split("none")) < 11
-    )
-    subset = subset.shuffle(seed=3407)
-    subset = subset.select(range(min(len(subset), max_samples)))
-    logger.info("Using %d samples after filtering.", len(subset))
-    return subset
 
 
 # ---------------------------------------------------------------------------
@@ -185,19 +209,10 @@ def accuracy_reward(completions, **kwargs):
 # ---------------------------------------------------------------------------
 # Model / LoRA helpers
 # ---------------------------------------------------------------------------
-def build_bnb_config() -> BitsAndBytesConfig:
-    return BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-
-
-def build_lora_config(lora_rank: int) -> LoraConfig:
+def build_lora_config(args) -> LoraConfig:
     return LoraConfig(
-        r=lora_rank,
-        lora_alpha=lora_rank * 2,
+        r=args.lora_rank,
+        lora_alpha=args.lora_rank * 2,
         lora_dropout=0.0,
         bias="none",
         task_type="CAUSAL_LM",
@@ -222,20 +237,39 @@ def main(args) -> None:
     login(token=hf_token)
 
     # ------------------------------------------------------------------
+    # Resolve model path (auto-detect merged/ subdir or adapter-only)
+    # ------------------------------------------------------------------
+    model_path = resolve_model_path(args.model_path)
+    logger.info("Resolved model path: %s", model_path)
+
+    # ------------------------------------------------------------------
     # Tokenizer
     # ------------------------------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
+        model_path,
         trust_remote_code=True,
         padding_side="left",
     )
+    if tokenizer.pad_token is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        # GRPOTrainer requires pad != eos.  Qwen models typically have a
+        # dedicated pad token, but if not, add one.
+        logger.warning(
+            "pad_token is None or same as eos_token. "
+            "Setting pad_token to '<|endoftext|>' or adding a new one."
+        )
+        if "<|endoftext|>" in tokenizer.get_vocab():
+            tokenizer.pad_token = "<|endoftext|>"
+            tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+        else:
+            tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
     assert tokenizer.pad_token_id != tokenizer.eos_token_id, (
         "pad_token and eos_token must not be the same. Check your tokenizer config."
     )
     logger.info(
-        "pad_token='%s' (id=%d), padding_side='%s'",
-        tokenizer.pad_token,
-        tokenizer.pad_token_id,
+        "pad_token='%s' (id=%d), eos_token='%s' (id=%d), padding_side='%s'",
+        tokenizer.pad_token, tokenizer.pad_token_id,
+        tokenizer.eos_token, tokenizer.eos_token_id,
         tokenizer.padding_side,
     )
 
@@ -254,43 +288,16 @@ def main(args) -> None:
     logger.info("Training on %d samples.", len(subset))
 
     # ------------------------------------------------------------------
-    # Model
-    # ------------------------------------------------------------------
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        # quantization_config=build_bnb_config(),
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        trust_remote_code=True,
-    )
-    model.config.use_cache = False
-
-    # ------------------------------------------------------------------
-    # vLLM sampling params
-    # ------------------------------------------------------------------
-    vllm_sampling_params = SamplingParams(
-        min_p=0.1,
-        top_p=1.0,
-        top_k=-1,
-        seed=3407,
-        stop=[tokenizer.eos_token],
-        include_stop_str_in_output=True,
-    )
-
-    # ------------------------------------------------------------------
     # GRPO config
     # ------------------------------------------------------------------
-    new_model_name = args.output_name or (args.model_path + "-grpo")
+    new_model_name = args.output_name or (args.model_path.rstrip("/") + "-grpo")
     logger.info("Output model name: %s", new_model_name)
 
     training_args = GRPOConfig(
         # vLLM
         use_vllm=args.use_vllm,
-        # vllm_sampling_params=vllm_sampling_params,
         # Generation
         temperature=1.0,
-        # max_prompt_length=args.max_prompt_length,
         max_completion_length=args.max_completion_length,
         num_generations=args.num_generations,
         # Optimiser
@@ -317,11 +324,10 @@ def main(args) -> None:
     )
 
     # ------------------------------------------------------------------
-    # Trainer
+    # Trainer — pass model_path as a string so GRPOTrainer handles loading
     # ------------------------------------------------------------------
     trainer = GRPOTrainer(
-        # model=model,
-        model=args.model_path,
+        model=model_path,
         processing_class=tokenizer,
         reward_funcs=[
             thinking_format_reward,
@@ -331,7 +337,7 @@ def main(args) -> None:
         ],
         args=training_args,
         train_dataset=subset,
-        peft_config=build_lora_config(args.lora_rank),
+        peft_config=build_lora_config(args),
     )
 
     logger.info("Starting GRPO training...")
@@ -387,6 +393,7 @@ if __name__ == "__main__":
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--report_to", type=str, default="none")
     parser.add_argument("--push_to_hub", action="store_true", default=True)
+    parser.add_argument("--no_push_to_hub", action="store_false", dest="push_to_hub")
 
     args = parser.parse_args()
     main(args)

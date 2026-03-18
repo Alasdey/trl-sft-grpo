@@ -270,14 +270,71 @@ def main(args) -> None:
     # ------------------------------------------------------------------
     # Save / push
     # ------------------------------------------------------------------
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    logger.info("Model saved locally to %s", args.output_dir)
+    logger.info("Merging LoRA adapter into base model...")
 
-    if args.push_to_hub:
-        trainer.model.push_to_hub(args.output_name)
-        tokenizer.push_to_hub(args.output_name)
-        logger.info("Model pushed to Hub as %s", args.output_name)
+    # For quantised models we must reload in full precision to merge cleanly
+    if args.quantize:
+        from peft import PeftModel
+
+        logger.info("Reloading base model in full precision for merge...")
+
+        # Save adapter to a temporary location
+        adapter_dir = os.path.join(args.output_dir, "_adapter_tmp")
+        trainer.model.save_pretrained(adapter_dir)
+
+        # Free the quantised model
+        del model
+        del trainer
+        torch.cuda.empty_cache()
+
+        # Reload base model in bf16 (no quantisation) on CPU to avoid OOM
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            trust_remote_code=True,
+        )
+
+        # Load adapter and merge
+        merged_model = PeftModel.from_pretrained(base_model, adapter_dir)
+        merged_model = merged_model.merge_and_unload()
+
+        # Save the full merged model
+        merged_dir = os.path.join(args.output_dir, "merged")
+        merged_model.save_pretrained(merged_dir)
+        tokenizer.save_pretrained(merged_dir)
+        logger.info("Merged model saved to %s", merged_dir)
+
+        # Clean up adapter temp dir
+        shutil.rmtree(adapter_dir, ignore_errors=True)
+
+        if args.push_to_hub:
+            merged_model.push_to_hub(args.output_name, token=hf_token)
+            tokenizer.push_to_hub(args.output_name, token=hf_token)
+            logger.info("Merged model pushed to Hub as %s", args.output_name)
+
+        del merged_model, base_model
+        torch.cuda.empty_cache()
+
+    else:
+        # No quantisation — we can merge in place
+        merged_model = trainer.model.merge_and_unload()
+
+        merged_dir = os.path.join(args.output_dir, "merged")
+        merged_model.save_pretrained(merged_dir)
+        tokenizer.save_pretrained(merged_dir)
+        logger.info("Merged model saved to %s", merged_dir)
+
+        if args.push_to_hub:
+            merged_model.push_to_hub(args.output_name, token=hf_token)
+            tokenizer.push_to_hub(args.output_name, token=hf_token)
+            logger.info("Merged model pushed to Hub as %s", args.output_name)
+
+    logger.info(
+        "Done. Use '%s' or '%s' as --model_path for GRPO.",
+        merged_dir,
+        args.output_name,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +348,7 @@ if __name__ == "__main__":
     # Model / data
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--data_path", type=str, default="Nofing/maven-ere-llm-sft-agg")
-    parser.add_argument("--data_max_sample", type=int, default=10_000)
+    parser.add_argument("--data_max_sample", type=int, default=8)
     parser.add_argument("--output_dir", type=str, default="outputs/sft")
     parser.add_argument("--output_name", type=str, default="Nofing/qwen3-4B-sft-ere")
     parser.add_argument("--hf_token", type=str, default=None)
@@ -302,7 +359,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -323,10 +380,12 @@ if __name__ == "__main__":
 
     # Misc
     parser.add_argument("--quantize", action="store_true", default=True)
+    parser.add_argument("--no_quantize", action="store_false", dest="quantize")
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--save_steps", type=int, default=400)
     parser.add_argument("--report_to", type=str, default="none", help="'wandb', 'tensorboard', or 'none'")
     parser.add_argument("--push_to_hub", action="store_true", default=True)
+    parser.add_argument("--no_push_to_hub", action="store_false", dest="push_to_hub")
 
     args = parser.parse_args()
     main(args)
