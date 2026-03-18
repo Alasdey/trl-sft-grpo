@@ -865,16 +865,6 @@ wheels = [
 ]
 
 [[package]]
-name = "flash-attn"
-version = "2.8.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "einops" },
-    { name = "torch" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/b2/8d76c41ad7974ee264754709c22963447f7f8134613fd9ce80984ed0dab7/flash_attn-2.8.3.tar.gz", hash = "sha256:1e71dd64a9e0280e0447b8a0c2541bad4bf6ac65bdeaa2f90e51a9e57de0370d", size = 8447812, upload-time = "2025-08-15T08:28:12.911Z" }
-
-[[package]]
 name = "frozendict"
 version = "2.4.7"
 source = { registry = "https://pypi.org/simple" }
@@ -4092,7 +4082,6 @@ dependencies = [
     { name = "accelerate" },
     { name = "bitsandbytes" },
     { name = "datasets" },
-    { name = "flash-attn" },
     { name = "huggingface-hub" },
     { name = "peft" },
     { name = "torch" },
@@ -4106,7 +4095,6 @@ requires-dist = [
     { name = "accelerate", specifier = ">=0.28.0" },
     { name = "bitsandbytes", specifier = ">=0.43.0" },
     { name = "datasets", specifier = ">=2.18.0" },
-    { name = "flash-attn", specifier = ">=2.8.3" },
     { name = "huggingface-hub", specifier = ">=0.22.0" },
     { name = "peft", specifier = ">=0.10.0" },
     { name = "torch", specifier = ">=2.1.0" },
