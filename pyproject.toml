@@ -8,6 +8,7 @@ dependencies = [
     "accelerate>=0.28.0",
     "bitsandbytes>=0.43.0",
     "datasets>=2.18.0",
+    "flash-attn>=2.8.3",
     "huggingface-hub>=0.22.0",
     "peft>=0.10.0",
     "torch>=2.1.0",
@@ -15,5 +16,5 @@ dependencies = [
     "trl[vllm]>=0.16.0",
     "wandb>=0.16.0",
 ]
-[tool.uv.extra-build-dependencies]
-flash-attn = ["setuptools"]
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
